@@ -14,13 +14,18 @@ unset (_current_dir_name)
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w")
 set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
 
+if (SANITIZE STREQUAL "undefined")
+    # 3rd-party libraries usually not intended to work with UBSan.
+    add_compile_options(-fno-sanitize=undefined)
+endif()
+
 set_property(DIRECTORY PROPERTY EXCLUDE_FROM_ALL 1)
 
+add_subdirectory (antlr4-runtime-cmake)
 add_subdirectory (boost-cmake)
 add_subdirectory (cctz-cmake)
 add_subdirectory (consistent-hashing-sumbur)
 add_subdirectory (consistent-hashing)
-add_subdirectory (croaring)
 add_subdirectory (FastMemcpy)
 add_subdirectory (hyperscan-cmake)
 add_subdirectory (jemalloc-cmake)
@@ -30,10 +35,11 @@ add_subdirectory (libmetrohash)
 add_subdirectory (lz4-cmake)
 add_subdirectory (murmurhash)
 add_subdirectory (replxx-cmake)
-add_subdirectory (ryu-cmake)
 add_subdirectory (unixodbc-cmake)
+add_subdirectory (xz)
 
 add_subdirectory (poco-cmake)
+add_subdirectory (croaring-cmake)
 
 
 # TODO: refactor the contrib libraries below this comment.
@@ -58,10 +64,6 @@ endif ()
 
 if (USE_INTERNAL_FARMHASH_LIBRARY)
     add_subdirectory (libfarmhash)
-endif ()
-
-if (USE_INTERNAL_BTRIE_LIBRARY)
-    add_subdirectory (libbtrie)
 endif ()
 
 if (USE_INTERNAL_ZLIB_LIBRARY)
@@ -157,9 +159,6 @@ if(USE_INTERNAL_SNAPPY_LIBRARY)
     add_subdirectory(snappy)
 
     set (SNAPPY_INCLUDE_DIR "${ClickHouse_SOURCE_DIR}/contrib/snappy")
-    if(SANITIZE STREQUAL "undefined")
-        target_compile_options(${SNAPPY_LIBRARY} PRIVATE -fno-sanitize=undefined)
-    endif()
 endif()
 
 if (USE_INTERNAL_PARQUET_LIBRARY)
@@ -318,3 +317,10 @@ if (USE_KRB5)
         add_subdirectory (cyrus-sasl-cmake)
     endif()
 endif()
+
+if (USE_INTERNAL_ROCKSDB_LIBRARY)
+    add_subdirectory(rocksdb-cmake)
+endif()
+
+add_subdirectory(dragonbox)
+add_subdirectory(fast_float)

@@ -5,7 +5,6 @@
 #if USE_MYSQL
 
 #include <Databases/MySQL/MaterializeMySQLSyncThread.h>
-
 #    include <cstdlib>
 #    include <random>
 #    include <Columns/ColumnTuple.h>
@@ -34,6 +33,8 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int ILLEGAL_MYSQL_VARIABLE;
+    extern const int SYNC_MYSQL_USER_ACCESS_ERROR;
+    extern const int UNKNOWN_DATABASE;
 }
 
 static constexpr auto MYSQL_BACKGROUND_THREAD_NAME = "MySQLDBSync";
@@ -92,7 +93,7 @@ MaterializeMySQLSyncThread::~MaterializeMySQLSyncThread()
     }
 }
 
-static String checkVariableAndGetVersion(const mysqlxx::Pool::Entry & connection)
+static void checkMySQLVariables(const mysqlxx::Pool::Entry & connection)
 {
     Block variables_header{
         {std::make_shared<DataTypeString>(), "Variable_name"},
@@ -105,7 +106,7 @@ static String checkVariableAndGetVersion(const mysqlxx::Pool::Entry & connection
          "OR (Variable_name = 'binlog_row_image' AND upper(Value) = 'FULL') "
          "OR (Variable_name = 'default_authentication_plugin' AND upper(Value) = 'MYSQL_NATIVE_PASSWORD');";
 
-    MySQLBlockInputStream variables_input(connection, check_query, variables_header, DEFAULT_BLOCK_SIZE);
+    MySQLBlockInputStream variables_input(connection, check_query, variables_header, DEFAULT_BLOCK_SIZE, false, true);
 
     Block variables_block = variables_input.read();
     if (!variables_block || variables_block.rows() != 4)
@@ -127,7 +128,7 @@ static String checkVariableAndGetVersion(const mysqlxx::Pool::Entry & connection
         }
 
         bool first = true;
-        std::stringstream error_message;
+        WriteBufferFromOwnString error_message;
         error_message << "Illegal MySQL variables, the MaterializeMySQL engine requires ";
         for (const auto & [variable_name, variable_error_message] : variables_error_message)
         {
@@ -139,15 +140,6 @@ static String checkVariableAndGetVersion(const mysqlxx::Pool::Entry & connection
 
         throw Exception(error_message.str(), ErrorCodes::ILLEGAL_MYSQL_VARIABLE);
     }
-
-    Block version_header{{std::make_shared<DataTypeString>(), "version"}};
-    MySQLBlockInputStream version_input(connection, "SELECT version() AS version;", version_header, DEFAULT_BLOCK_SIZE);
-
-    Block version_block = version_input.read();
-    if (!version_block || version_block.rows() != 1)
-        throw Exception("LOGICAL ERROR: cannot get mysql version.", ErrorCodes::LOGICAL_ERROR);
-
-    return version_block.getByPosition(0).column->getDataAt(0).toString();
 }
 
 MaterializeMySQLSyncThread::MaterializeMySQLSyncThread(
@@ -159,13 +151,13 @@ MaterializeMySQLSyncThread::MaterializeMySQLSyncThread(
     query_prefix = "EXTERNAL DDL FROM MySQL(" + backQuoteIfNeed(database_name) + ", " + backQuoteIfNeed(mysql_database_name) + ") ";
 }
 
-void MaterializeMySQLSyncThread::synchronization(const String & mysql_version)
+void MaterializeMySQLSyncThread::synchronization()
 {
     setThreadName(MYSQL_BACKGROUND_THREAD_NAME);
 
     try
     {
-        if (std::optional<MaterializeMetadata> metadata = prepareSynchronized(mysql_version))
+        if (std::optional<MaterializeMetadata> metadata = prepareSynchronized())
         {
             Stopwatch watch;
             Buffers buffers(database_name);
@@ -214,10 +206,31 @@ void MaterializeMySQLSyncThread::stopSynchronization()
 
 void MaterializeMySQLSyncThread::startSynchronization()
 {
-    const auto & mysql_server_version = checkVariableAndGetVersion(pool.get());
-
-    background_thread_pool = std::make_unique<ThreadFromGlobalPool>(
-        [this, mysql_server_version = mysql_server_version]() { synchronization(mysql_server_version); });
+    try
+    {
+        checkMySQLVariables(pool.get());
+        background_thread_pool = std::make_unique<ThreadFromGlobalPool>([this]() { synchronization(); });
+    }
+    catch (...)
+    {
+        try
+        {
+            throw;
+        }
+        catch (mysqlxx::ConnectionFailed & e)
+        {
+            if (e.errnum() == ER_ACCESS_DENIED_ERROR
+                || e.errnum() == ER_DBACCESS_DENIED_ERROR)
+                throw Exception("MySQL SYNC USER ACCESS ERR: mysql sync user needs "
+                                "at least GLOBAL PRIVILEGES:'RELOAD, REPLICATION SLAVE, REPLICATION CLIENT' "
+                                "and SELECT PRIVILEGE on Database " + mysql_database_name
+                    , ErrorCodes::SYNC_MYSQL_USER_ACCESS_ERROR);
+            else if (e.errnum() == ER_BAD_DB_ERROR)
+                throw Exception("Unknown database '" + mysql_database_name + "' on MySQL", ErrorCodes::UNKNOWN_DATABASE);
+            else
+                throw;
+        }
+    }
 }
 
 static inline void cleanOutdatedTables(const String & database_name, const Context & context)
@@ -238,7 +251,7 @@ static inline BlockOutputStreamPtr getTableOutput(const String & database_name, 
 {
     const StoragePtr & storage = DatabaseCatalog::instance().getTable(StorageID(database_name, table_name), query_context);
 
-    std::stringstream insert_columns_str;
+    WriteBufferFromOwnString insert_columns_str;
     const StorageInMemoryMetadata & storage_metadata = storage->getInMemoryMetadata();
     const ColumnsDescription & storage_columns = storage_metadata.getColumns();
     const NamesAndTypesList & insert_columns_names = insert_materialized ? storage_columns.getAllPhysical() : storage_columns.getOrdinary();
@@ -300,7 +313,7 @@ static inline UInt32 randomNumber()
     return dist6(rng);
 }
 
-std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchronized(const String & mysql_version)
+std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchronized()
 {
     bool opened_transaction = false;
     mysqlxx::PoolWithFailover::Entry connection;
@@ -313,8 +326,7 @@ std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchroniz
             opened_transaction = false;
 
             MaterializeMetadata metadata(
-                connection, getDatabase(database_name).getMetadataPath() + "/.metadata",
-                mysql_database_name, opened_transaction, mysql_version);
+                connection, getDatabase(database_name).getMetadataPath() + "/.metadata", mysql_database_name, opened_transaction);
 
             if (!metadata.need_dumping_tables.empty())
             {
@@ -329,9 +341,9 @@ std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchroniz
 
                 const auto & position_message = [&]()
                 {
-                    std::stringstream ss;
-                    position.dump(ss);
-                    return ss.str();
+                    WriteBufferFromOwnString buf;
+                    position.dump(buf);
+                    return buf.str();
                 };
                 LOG_INFO(log, "MySQL dump database position: \n {}", position_message());
             }
@@ -340,7 +352,7 @@ std::optional<MaterializeMetadata> MaterializeMySQLSyncThread::prepareSynchroniz
                 connection->query("COMMIT").execute();
 
             client.connect();
-            client.startBinlogDumpGTID(randomNumber(), mysql_database_name, metadata.executed_gtid_set);
+            client.startBinlogDumpGTID(randomNumber(), mysql_database_name, metadata.executed_gtid_set, metadata.binlog_checksum);
             return metadata;
         }
         catch (...)
@@ -371,9 +383,9 @@ void MaterializeMySQLSyncThread::flushBuffersData(Buffers & buffers, Materialize
 
     const auto & position_message = [&]()
     {
-        std::stringstream ss;
-        client.getPosition().dump(ss);
-        return ss.str();
+        WriteBufferFromOwnString buf;
+        client.getPosition().dump(buf);
+        return buf.str();
     };
     LOG_INFO(log, "MySQL executed position: \n {}", position_message());
 }
@@ -462,6 +474,8 @@ static void writeFieldsToColumn(
             write_data_to_column(casted_decimal_128_column, Decimal128(), Decimal128());
         else if (ColumnDecimal<Decimal256> * casted_decimal_256_column = typeid_cast<ColumnDecimal<Decimal256> *>(&column_to))
             write_data_to_column(casted_decimal_256_column, Decimal256(), Decimal256());
+        else if (ColumnDecimal<DateTime64> * casted_datetime_64_column = typeid_cast<ColumnDecimal<DateTime64> *>(&column_to))
+            write_data_to_column(casted_datetime_64_column, DateTime64(), DateTime64());
         else if (ColumnInt32 * casted_int32_column = typeid_cast<ColumnInt32 *>(&column_to))
         {
             for (size_t index = 0; index < rows_data.size(); ++index)
@@ -619,35 +633,52 @@ void MaterializeMySQLSyncThread::onEvent(Buffers & buffers, const BinlogEventPtr
     else if (receive_event->type() == MYSQL_QUERY_EVENT)
     {
         QueryEvent & query_event = static_cast<QueryEvent &>(*receive_event);
-        flushBuffersData(buffers, metadata);
-
-        try
+        Position position_before_ddl;
+        position_before_ddl.update(metadata.binlog_position, metadata.binlog_file, metadata.executed_gtid_set);
+        metadata.transaction(position_before_ddl, [&]() { buffers.commit(global_context); });
+        metadata.transaction(client.getPosition(),[&](){ executeDDLAtomic(query_event); });
+    }
+    else
+    {
+        /// MYSQL_UNHANDLED_EVENT
+        if (receive_event->header.type == ROTATE_EVENT)
         {
-            Context query_context = createQueryContext(global_context);
-            String comment = "Materialize MySQL step 2: execute MySQL DDL for sync data";
-            String event_database = query_event.schema == mysql_database_name ? database_name : "";
-            tryToExecuteQuery(query_prefix + query_event.query, query_context, event_database, comment);
+            /// Some behaviors(such as changing the value of "binlog_checksum") rotate the binlog file.
+            /// To ensure that the synchronization continues, we need to handle these events
+            metadata.fetchMasterVariablesValue(pool.get());
+            client.setBinlogChecksum(metadata.binlog_checksum);
         }
-        catch (Exception & exception)
+        else if (receive_event->header.type != HEARTBEAT_EVENT)
         {
-            tryLogCurrentException(log);
+            const auto & dump_event_message = [&]()
+            {
+                WriteBufferFromOwnString buf;
+                receive_event->dump(buf);
+                return buf.str();
+            };
 
-            /// If some DDL query was not successfully parsed and executed
-            /// Then replication may fail on next binlog events anyway
-            if (exception.code() != ErrorCodes::SYNTAX_ERROR)
-                throw;
+            LOG_DEBUG(log, "Skip MySQL event: \n {}", dump_event_message());
         }
     }
-    else if (receive_event->header.type != HEARTBEAT_EVENT)
-    {
-        const auto & dump_event_message = [&]()
-        {
-            std::stringstream ss;
-            receive_event->dump(ss);
-            return ss.str();
-        };
+}
 
-        LOG_DEBUG(log, "Skip MySQL event: \n {}", dump_event_message());
+void MaterializeMySQLSyncThread::executeDDLAtomic(const QueryEvent & query_event)
+{
+    try
+    {
+        Context query_context = createQueryContext(global_context);
+        String comment = "Materialize MySQL step 2: execute MySQL DDL for sync data";
+        String event_database = query_event.schema == mysql_database_name ? database_name : "";
+        tryToExecuteQuery(query_prefix + query_event.query, query_context, event_database, comment);
+    }
+    catch (Exception & exception)
+    {
+        tryLogCurrentException(log);
+
+        /// If some DDL query was not successfully parsed and executed
+        /// Then replication may fail on next binlog events anyway
+        if (exception.code() != ErrorCodes::SYNTAX_ERROR)
+            throw;
     }
 }
 
